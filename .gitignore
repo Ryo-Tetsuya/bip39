@@ -1,0 +1,4 @@
+.DS_Store
+encrypted_dot_DS_Store.age
+/target/
+/seed_backup*.json.age
