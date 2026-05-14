@@ -18,11 +18,11 @@ use bitcoin::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use eframe::egui;
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use slip10::{derive_key_from_path, BIP32Path, Curve};
+use sha2::{Digest, Sha256, Sha512};
 use sskr::{sskr_combine, sskr_generate, GroupSpec, Secret, Spec};
 use tiny_keccak::Hasher;
 use zeroize::{Zeroize, Zeroizing};
@@ -34,6 +34,7 @@ const MAX_DERIVE_COUNT: u32 = 100;
 const MAX_SSKR_GROUPS: u8 = 16;
 const MAX_SSKR_SHARES_PER_GROUP: u8 = 16;
 const BACKUP_SCHEMA_VERSION: u32 = 2;
+const BIP32_HARDENED_OFFSET: u32 = 1 << 31;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -2372,11 +2373,8 @@ fn derive_address_rows(
         AddressKind::Solana => {
             for index in start..=end {
                 let path = derivation_path_for(kind, index, true);
-                let parsed_path = path
-                    .parse::<BIP32Path>()
-                    .map_err(|err| format!("Invalid Solana path: {err:?}"))?;
-                let derived = derive_key_from_path(seed, Curve::Ed25519, &parsed_path)
-                    .map_err(|err| format!("Failed to derive Solana key: {err:?}"))?;
+                let derived =
+                    Zeroizing::new(derive_slip10_ed25519_key(seed, &[44, 501, index, 0])?);
                 let signing_key = SigningKey::from_bytes(&derived.key);
                 let verifying_key = VerifyingKey::from(&signing_key);
 
@@ -2391,6 +2389,68 @@ fn derive_address_rows(
     }
 
     Ok(rows)
+}
+
+type HmacSha512 = Hmac<Sha512>;
+
+struct Slip10Ed25519Key {
+    key: [u8; 32],
+    chain_code: [u8; 32],
+}
+
+impl Zeroize for Slip10Ed25519Key {
+    fn zeroize(&mut self) {
+        self.key.zeroize();
+        self.chain_code.zeroize();
+    }
+}
+
+fn derive_slip10_ed25519_key(seed: &[u8], path: &[u32]) -> Result<Slip10Ed25519Key, String> {
+    let mut key = Zeroizing::new(slip10_hmac_key(b"ed25519 seed", seed));
+
+    for index in path {
+        key = Zeroizing::new(slip10_child_key(&key, *index)?);
+    }
+
+    let mut final_key = Slip10Ed25519Key {
+        key: [0u8; 32],
+        chain_code: [0u8; 32],
+    };
+    final_key.key.copy_from_slice(&key.key);
+    final_key.chain_code.copy_from_slice(&key.chain_code);
+    Ok(final_key)
+}
+
+fn slip10_child_key(parent: &Slip10Ed25519Key, index: u32) -> Result<Slip10Ed25519Key, String> {
+    if index >= BIP32_HARDENED_OFFSET {
+        return Err(format!(
+            "Solana derivation index must be below {BIP32_HARDENED_OFFSET}."
+        ));
+    }
+
+    let hardened_index = index + BIP32_HARDENED_OFFSET;
+    let mut data = Zeroizing::new([0u8; 37]);
+    data[1..33].copy_from_slice(&parent.key);
+    data[33..].copy_from_slice(&hardened_index.to_be_bytes());
+
+    Ok(slip10_hmac_key(&parent.chain_code, &data[..]))
+}
+
+fn slip10_hmac_key(key: &[u8], data: &[u8]) -> Slip10Ed25519Key {
+    let mut mac = HmacSha512::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(data);
+    let mut output = mac.finalize().into_bytes();
+
+    let mut private_key = [0u8; 32];
+    let mut chain_code = [0u8; 32];
+    private_key.copy_from_slice(&output[..32]);
+    chain_code.copy_from_slice(&output[32..]);
+    output.as_mut_slice().zeroize();
+
+    Slip10Ed25519Key {
+        key: private_key,
+        chain_code,
+    }
 }
 
 fn ethereum_address_from_pubkey(pubkey: &PublicKey) -> String {
@@ -2537,6 +2597,21 @@ AGE-SECRET-KEY-should-be-ignored
         assert_eq!(
             display_json_value("share_hex", &share["share_hex"], true),
             "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn slip10_ed25519_derivation_matches_reference_vector() {
+        let seed = hex::decode("000102030405060708090a0b0c0d0e0f").unwrap();
+        let key = derive_slip10_ed25519_key(&seed, &[0, 1]).unwrap();
+
+        assert_eq!(
+            hex::encode(key.key),
+            "b1d0bad404bf35da785a64ca1ac54b2617211d2777696fbffaf208f746ae84f2"
+        );
+        assert_eq!(
+            hex::encode(key.chain_code),
+            "a320425f77d1b5c2505a6b1b27382b37368ee640e3557c315416801243552f14"
         );
     }
 
